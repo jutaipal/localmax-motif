@@ -9,7 +9,7 @@
 /* VERSION 0.2, 13 Jan 2025   part of AUTOSEED code modified to enable bitstream input (sequences of arbitrary length)   */
 /* bitstream and multithreaded code written with assistance from Claude 3.5 Sonnet and ChatGPT4 and o1                   */
 /* Debugged manually by J Taipale as bit shifting is not their forte                                                     */
-/* Compile with clang -march=native -ffast-math -O3 -o localmax_motif localmax_motif.c                             */
+/* Compile with clang -march=native -ffast-math -O3 -o localmax-motif localmax-motif.c                             */
 
 /* GLOBAL VARIABLES */
 uint64_t mask_ULL[42][42];   /* PRIMARY mask_ULL FOR EACH SEPARATE NUCLEOTIDE */

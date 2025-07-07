@@ -5,11 +5,15 @@
 #include <inttypes.h>
 #include <string.h>
 #include <time.h>
+#include <math.h>
+#include <stdatomic.h>
+
+#define MAX(x, y) ((x) > (y) ? (x) : (y))
 
 /* VERSION 0.2, 13 Jan 2025   part of AUTOSEED code modified to enable bitstream input (sequences of arbitrary length)   */
 /* bitstream and multithreaded code written with assistance from Claude 3.5 Sonnet and ChatGPT4 and o1                   */
 /* Debugged manually by J Taipale as bit shifting is not their forte                                                     */
-/* Compile with clang -march=native -ffast-math -O3 -o localmax-motif localmax-motif.c                             */
+/* Compile with clang -march=native -ffast-math -O3 -o localmax_motif localmax_motif.c                             */
 
 /* GLOBAL VARIABLES */
 uint64_t mask_ULL[42][42];   /* PRIMARY mask_ULL FOR EACH SEPARATE NUCLEOTIDE */
@@ -25,6 +29,50 @@ short int Nlength = 32;              /* LENGTH OF MASK */
 #define MAX_SEQ_LEN 500  // Adjust if needed for your use case
 #define MAX_WIDTH_OF_PWM 40
 #define FLANK_WIDTH 5
+#define SHIFTED_GAP_POSITIONS 1    // count also gap positions that are shifted from center
+
+// STRUCTURES
+
+typedef _Atomic size_t atomic_size_t;
+
+// LineBuffer structure to include 5D results
+typedef struct {
+    uint64_t***** results;  // 5D array [file][kmer_len][gap_pos][gap_len][kmer]
+    uint64_t* bitstream;
+    uint64_t* temp_bitstream;
+    int max_seq_length;
+    int file_index;
+    char finished;
+    pthread_mutex_t mutex;
+    pthread_cond_t not_full;
+    pthread_cond_t not_empty;
+    char** sequences;
+    size_t* seq_lengths;
+    int write_pos;
+    int read_pos;
+    int count;
+    int shortest_kmer;     // Add these
+    int longest_kmer;      // two fields
+    FILE* file;
+} LineBuffer;
+
+
+typedef struct PWMConsumerArgs {
+    LineBuffer* buffer;
+    struct normalized_pwm* signal_pwm;        // Input PWM for finding matches
+    struct normalized_pwm* background_pwm;     // Input background PWM for corrections
+    struct count_pwm* signal_output_pwm;      // Output PWM for signal counts
+    struct count_pwm* background_output_pwm;   // Output PWM for background counts
+    double cutoff;
+    _Atomic(size_t) *total_reads;    // Use _Atomic qualifier
+    _Atomic(size_t) *matched_reads;
+    int num_files;
+    // K-mer counting additions
+    int kmer_length;                 // Length of k-mers to count
+    double lambda;
+    uint64_t** kmer_counts;          // Array to store k-mer counts for all files
+} PWMConsumerArgs;
+
 
 struct match {short int *position; double *score;};
 short int match_init (struct match *i, short int width)
@@ -42,13 +90,14 @@ return(0);
 }
 
 /* COUNT PWM */
-struct count_pwm {char *name; short int width; long int max_counts; double **incidence;};
+struct count_pwm {char *name; short int width; long int max_counts; double **incidence; double enrichment;};
 short int count_pwm_clear (struct count_pwm *i, char *name, short int width, double initial_value)
 {
 short int maximum_width = MAX_WIDTH_OF_PWM;
 short int counter;
 short int counter2;
 strcpy ((*i).name, name);
+(*i).enrichment = 0;
 (*i).width = width;
 (*i).max_counts = initial_value;
 for (counter = 0; counter < 5; counter++)
@@ -84,12 +133,13 @@ short int count_pwm_free (struct count_pwm *i)
 }
 
 /* NORMALIZED PWM */
-struct normalized_pwm {char *name; char *seed; short int width; long int max_counts; double *information_content; short int *original_position; double *position_score; long int *total_counts_for_column; double **fraction; short int negative_values_allowed;};
+struct normalized_pwm {char *name; char *seed; short int width; long int max_counts; double *information_content; short int *original_position; double *position_score; long int *total_counts_for_column; double **fraction; double enrichment; short int negative_values_allowed;};
 short int normalized_pwm_init (struct normalized_pwm *i, char *name, short int width, double initial_value)
 {
 short int maximum_width = MAX_WIDTH_OF_PWM;
 short int counter;
 short int counter2;
+(*i).enrichment = 0;
 (*i).negative_values_allowed = 0;
 (*i).name = malloc(100);
 strcpy ((*i).name, name);
@@ -157,6 +207,9 @@ short int iupac_length = 15;
 /* BUILDS PWM */
 for(pwm_position = 0; pwm_position < (*n).width; pwm_position++)
 {
+// substitutes to allow lower case n
+    if (searchstring[pwm_position] == 'n') searchstring[pwm_position] = 'N';
+    
 //printf("\n");
 for(current_match_position = 0; (current_match_position < iupac_length) & (searchstring[pwm_position] != nucleotide_iupac[current_match_position]); current_match_position++)
 ;
@@ -354,11 +407,11 @@ short int Multinomial_add_to_pwm_from_bitstream(struct count_pwm *p, struct norm
         {
             nucleotide = main_reg & 0x3;
             seed_position = pwm_position - FLANK_WIDTH;
-            if (seed_position >= 0 && seed_position < (*qp).width) in_seed = 1;
+            if (seed_position > 0 && seed_position <= (*qp).width) in_seed = 1;
             else {in_seed = 0; seed_position = 0;} // to prevent segfault
             
             // EXCLUDES CONSENSUS IF THERE IS MISMATCH
-            if (in_seed == 1 && score < cut_off + 1 && (*qp).fraction[nucleotide][seed_position] == 0)
+            if (in_seed == 1 && score <= cut_off + 1 && (*qp).fraction[nucleotide][seed_position-1] == 0)
             {
                 // printf("\nExcluding nucleotide %c from PWM position %i, shifted match %i, seed position %i", "ACGT"[nucleotide], pwm_position, shifted_match_position, seed_position);
                 // (*p).incidence[nucleotide][pwm_position]++;
@@ -504,6 +557,107 @@ void Kmerprint (__uint128_t print_sequence_value, short int kmer_length, short i
     }
 }
 
+// Comparison function for qsort
+static int compare_counts(const void *a, const void *b) {
+    return (*(long int*)b - *(long int*)a); // Sort in descending order
+}
+
+// smooths counts if smooth parameter is set to 2
+long int smooth_kmer_counts(long int *****results,
+                          short int file_number,
+                          long int kmer,
+                          short int kmer_length,
+                          short int gap_position,
+                          short int gap_length,
+                          short int smooth) {
+    
+    // Return unsmoothed count if smooth is 0
+    if (smooth != 2) {
+        return results[file_number][kmer_length][gap_position][gap_length][kmer];
+    }
+    
+    // Get original kmer count
+    long int original_count = results[file_number][kmer_length][gap_position][gap_length][kmer];
+    
+    // Store neighbor counts (excluding original kmer)
+    long int neighbor_counts[3 * kmer_length]; // Max neighbors: 3 options per position
+    int count = 0;
+    
+    // Generate all Hamming distance 1 neighbors
+    long int lowbit = 1;  // For A-C or G-T transitions
+    long int highbit = 2; // For A-G or C-T transitions
+    long int compared_kmer;
+    
+    for(short int position = 0; position < kmer_length; position++, lowbit <<= 2, highbit <<= 2) {
+        // First substitution (A↔C, G↔T)
+        compared_kmer = lowbit ^ kmer;
+        neighbor_counts[count++] = results[file_number][kmer_length][gap_position][gap_length][compared_kmer];
+        
+        // Second substitution (A↔G, C↔T)
+        compared_kmer = highbit ^ kmer;
+        neighbor_counts[count++] = results[file_number][kmer_length][gap_position][gap_length][compared_kmer];
+        
+        // Third substitution (A↔T, C↔G)
+        compared_kmer = lowbit ^ compared_kmer;
+        neighbor_counts[count++] = results[file_number][kmer_length][gap_position][gap_length][compared_kmer];
+    }
+    
+    // Sort counts in descending order
+    qsort(neighbor_counts, count, sizeof(long int), compare_counts);
+    
+    // Average top 10 neighbor counts (or all if less than 10)
+    int top_n = (count < 10) ? count : 10;
+    long int sum = 0;
+    for(int i = 0; i < top_n; i++) {
+        sum += neighbor_counts[i];
+    }
+    long int neighbor_average = sum / top_n;
+    
+    // Return 50-50 blend of original count and neighbor average
+    return (original_count + neighbor_average) / 2;
+}
+
+// inline function to check if another kmer count is higher than current kmer
+static inline int check_kmer(
+    long int *****results,
+    short int file_number,
+    short int current_kmer_length,
+    short int current_gap_position,
+    short int current_gap_length,
+    long int compared_kmer,
+    long int kmer1_incidence,
+    int background_subtraction,
+    double scale_factor,
+    double kmer_length_difference_cutoff,
+    short int original_kmer_length)  // Added parameter
+{
+    long int kmer2_incidence = smooth_kmer_counts(results, file_number, compared_kmer, current_kmer_length, current_gap_position, current_gap_length, background_subtraction);
+    long int background;
+
+    if (background_subtraction) {
+        if (scale_factor >= 1.0) {
+            background = smooth_kmer_counts(results, 0, compared_kmer, current_kmer_length, current_gap_position, current_gap_length, background_subtraction);
+            kmer2_incidence -= background * (long int)scale_factor;
+        } else {
+            background = smooth_kmer_counts(results, 0, compared_kmer, current_kmer_length, current_gap_position, current_gap_length, background_subtraction);
+            kmer2_incidence = kmer2_incidence * (long int)(1.0/scale_factor) - background;
+        }
+    }
+    
+    // Regular comparison for same length kmers
+    if (current_kmer_length == original_kmer_length) {
+        return (kmer2_incidence > kmer1_incidence);
+    }
+    // For longer kmers, divide kmer1 by cutoff
+    else if (current_kmer_length > original_kmer_length) {
+        return (kmer2_incidence > kmer1_incidence * kmer_length_difference_cutoff);
+    }
+    // For shorter kmers, multiply kmer2 by cutoff
+    else {
+        return (kmer2_incidence * kmer_length_difference_cutoff > kmer1_incidence);
+    }
+}
+
 /* SUBROUTINE THAT DETERMINES IF GAP IS AT EITHER OF THE CENTER POSITIONS, IF count_also is set to != 1 returns true */
 short int Centergap (short int count_also_spaced_kmers, short int kmer_length, short int gap_position)
 {
@@ -513,13 +667,353 @@ if (kmer_length % 2 == 1 && gap_position == kmer_length / 2 - 1) return (1);
 else return (0);
 }
 
+short int Localmax(long int *****results, short int file_number, short int current_kmer_length,
+                  short int shortest_kmer, short int longest_kmer_counted, short int current_gap_position,
+                  short int current_gap_length, long int current_kmer, double kmer_length_difference_cutoff,
+                  short int background_subtraction, double scale_factor)
+{
+    short int original_kmer_length = current_kmer_length;
+    short int count_also_spaced_kmers = 1;
+    short int too_long_kmer = longest_kmer_counted + 1;
+
+    // Calculate initial kmer1_incidence
+    long int kmer1_incidence;
+    if (background_subtraction) {
+        if (scale_factor >= 1.0) {
+            long int background = smooth_kmer_counts(results, 0, current_kmer, current_kmer_length, current_gap_position, current_gap_length, 1);
+            kmer1_incidence = smooth_kmer_counts(results, file_number, current_kmer, current_kmer_length, current_gap_position, current_gap_length, background_subtraction)
+                             - background * (long int)scale_factor;
+        } else {
+            long int background = smooth_kmer_counts(results, 0, current_kmer, current_kmer_length, current_gap_position, current_gap_length, 1);
+            kmer1_incidence = smooth_kmer_counts(results, file_number, current_kmer, current_kmer_length, current_gap_position, current_gap_length, background_subtraction)
+                             * (long int)(1.0/scale_factor) - background;
+        }
+    } else {
+        kmer1_incidence = smooth_kmer_counts(results, file_number, current_kmer, current_kmer_length, current_gap_position, current_gap_length, background_subtraction);
+    }
+
+    long int compared_kmer = current_kmer;
+    signed short int position;
+    short int counter;
+    short int first_half;
+    long int lowbit = 1;
+    long int highbit = 2;
+    short int shift;
+    short int true_gap_position = current_gap_position;
+    short int true_gap_length = current_gap_length;
+    short int start;
+    short int end;
+    short int left = 0;
+    short int right = 1;
+    signed short int position2;
+    
+    /* Substitution; HAMMING OF 1 */
+    for(position=0; position < current_kmer_length; position++, lowbit <<= 2, highbit <<= 2) {
+        compared_kmer = lowbit ^ current_kmer;
+        if(check_kmer(results, file_number, current_kmer_length, current_gap_position, current_gap_length, compared_kmer, kmer1_incidence, background_subtraction, scale_factor, kmer_length_difference_cutoff, original_kmer_length)) return 0;
+        
+        compared_kmer = highbit ^ current_kmer;
+        if(check_kmer(results, file_number, current_kmer_length, current_gap_position, current_gap_length, compared_kmer, kmer1_incidence, background_subtraction, scale_factor, kmer_length_difference_cutoff, original_kmer_length)) return 0;
+        
+        compared_kmer = lowbit ^ compared_kmer;
+        if(check_kmer(results, file_number, current_kmer_length, current_gap_position, current_gap_length, compared_kmer, kmer1_incidence, background_subtraction, scale_factor, kmer_length_difference_cutoff, original_kmer_length)) return 0;
+    }
+    
+    /* Shift */
+    shift = (current_gap_length != 0);
+    current_gap_position += shift;
+    
+    if (current_gap_length == 0 || (count_also_spaced_kmers == 2 - SHIFTED_GAP_POSITIONS && current_gap_position < current_kmer_length)
+        || (current_kmer_length % 2 == 1 && count_also_spaced_kmers == 1 && current_gap_position == current_kmer_length / 2 + 1)) {
+        
+        compared_kmer = (current_kmer >> 2) & lowmask_ULL[current_kmer_length-1];
+        if(check_kmer(results, file_number, current_kmer_length, current_gap_position, current_gap_length, compared_kmer, kmer1_incidence, background_subtraction, scale_factor, kmer_length_difference_cutoff, original_kmer_length)) return 0;
+        
+        lowbit >>= 2; highbit >>= 2;
+        compared_kmer = lowbit ^ compared_kmer;
+        if(check_kmer(results, file_number, current_kmer_length, current_gap_position, current_gap_length, compared_kmer, kmer1_incidence, background_subtraction, scale_factor, kmer_length_difference_cutoff, original_kmer_length)) return 0;
+        
+        compared_kmer = highbit ^ compared_kmer;
+        if(check_kmer(results, file_number, current_kmer_length, current_gap_position, current_gap_length, compared_kmer, kmer1_incidence, background_subtraction, scale_factor, kmer_length_difference_cutoff, original_kmer_length)) return 0;
+        
+        compared_kmer = lowbit ^ compared_kmer;
+        if(check_kmer(results, file_number, current_kmer_length, current_gap_position, current_gap_length, compared_kmer, kmer1_incidence, background_subtraction, scale_factor, kmer_length_difference_cutoff, original_kmer_length)) return 0;
+    }
+    
+    current_gap_position -= shift;
+    current_gap_position -= shift;
+    if (current_gap_length == 0 || (count_also_spaced_kmers == 2 - SHIFTED_GAP_POSITIONS && current_gap_position > 0)
+        || (current_kmer_length % 2 == 1 && count_also_spaced_kmers == 1 && current_gap_position == current_kmer_length / 2)) {
+        
+        compared_kmer = (current_kmer << 2) & lowmask_ULL[current_kmer_length-1];
+        if(check_kmer(results, file_number, current_kmer_length, current_gap_position, current_gap_length, compared_kmer, kmer1_incidence, background_subtraction, scale_factor, kmer_length_difference_cutoff, original_kmer_length)) return 0;
+        
+        lowbit = 1; highbit = 2;
+        compared_kmer = lowbit ^ compared_kmer;
+        if(check_kmer(results, file_number, current_kmer_length, current_gap_position, current_gap_length, compared_kmer, kmer1_incidence, background_subtraction, scale_factor, kmer_length_difference_cutoff, original_kmer_length)) return 0;
+        
+        compared_kmer = highbit ^ compared_kmer;
+        if(check_kmer(results, file_number, current_kmer_length, current_gap_position, current_gap_length, compared_kmer, kmer1_incidence, background_subtraction, scale_factor, kmer_length_difference_cutoff, original_kmer_length)) return 0;
+        
+        compared_kmer = lowbit ^ compared_kmer;
+        if(check_kmer(results, file_number, current_kmer_length, current_gap_position, current_gap_length, compared_kmer, kmer1_incidence, background_subtraction, scale_factor, kmer_length_difference_cutoff, original_kmer_length)) return 0;
+    }
+    
+    current_gap_position += shift;
+    lowbit = 1; highbit = 2;
+    if (count_also_spaced_kmers != 0) {
+        if(current_gap_position == 0) current_gap_position = current_kmer_length / 2;
+        
+        /* Longer Gap */
+        current_gap_length++;
+        if (current_gap_length < Nlength - current_kmer_length && current_gap_length < MAX_GAP_LENGTH && true_gap_length != 0) {
+            compared_kmer = (current_kmer & highmask_ULL[current_kmer_length-current_gap_position]) | ((current_kmer << 2) & (lowmask_ULL[current_kmer_length-current_gap_position-1]));
+            
+            for(first_half = 0; first_half < 2; first_half++) {
+                if(check_kmer(results, file_number, current_kmer_length, current_gap_position, current_gap_length, compared_kmer, kmer1_incidence, background_subtraction, scale_factor, kmer_length_difference_cutoff, original_kmer_length)) return 0;
+                
+                compared_kmer = lowbit ^ compared_kmer;
+                if(check_kmer(results, file_number, current_kmer_length, current_gap_position, current_gap_length, compared_kmer, kmer1_incidence, background_subtraction, scale_factor, kmer_length_difference_cutoff, original_kmer_length)) return 0;
+                
+                compared_kmer = highbit ^ compared_kmer;
+                if(check_kmer(results, file_number, current_kmer_length, current_gap_position, current_gap_length, compared_kmer, kmer1_incidence, background_subtraction, scale_factor, kmer_length_difference_cutoff, original_kmer_length)) return 0;
+                
+                compared_kmer = lowbit ^ compared_kmer;
+                if(check_kmer(results, file_number, current_kmer_length, current_gap_position, current_gap_length, compared_kmer, kmer1_incidence, background_subtraction, scale_factor, kmer_length_difference_cutoff, original_kmer_length)) return 0;
+                
+                compared_kmer = ((current_kmer >> 2) & highmask_ULL[current_kmer_length-current_gap_position]) | ((current_kmer) & (lowmask_ULL[current_kmer_length-current_gap_position-1]));
+                lowbit <<= ((current_kmer_length - 1)*2); highbit <<= ((current_kmer_length - 1)*2);
+            }
+        }
+        
+        /* Shorter Gap */
+        current_gap_length--;
+        current_gap_length--;
+        
+        lowbit = 1; highbit = 2;
+        lowbit <<= ((current_kmer_length - true_gap_position - 1)*2); highbit <<= ((current_kmer_length - true_gap_position - 1)*2);
+        if (current_gap_length == 0) current_gap_position = 0;
+        if (current_gap_length >= 0) {
+            compared_kmer = (current_kmer & highmask_ULL[current_kmer_length - true_gap_position]) | ((current_kmer >> 2) & (lowmask_ULL[current_kmer_length-true_gap_position-1]));
+            
+            for(first_half = 0; first_half < 2; first_half++) {
+                if(check_kmer(results, file_number, current_kmer_length, current_gap_position, current_gap_length, compared_kmer, kmer1_incidence, background_subtraction, scale_factor, kmer_length_difference_cutoff, original_kmer_length)) return 0;
+                
+                compared_kmer = lowbit ^ compared_kmer;
+                if(check_kmer(results, file_number, current_kmer_length, current_gap_position, current_gap_length, compared_kmer, kmer1_incidence, background_subtraction, scale_factor, kmer_length_difference_cutoff, original_kmer_length)) return 0;
+                
+                compared_kmer = highbit ^ compared_kmer;
+                if(check_kmer(results, file_number, current_kmer_length, current_gap_position, current_gap_length, compared_kmer, kmer1_incidence, background_subtraction, scale_factor, kmer_length_difference_cutoff, original_kmer_length)) return 0;
+                
+                compared_kmer = lowbit ^ compared_kmer;
+                if(check_kmer(results, file_number, current_kmer_length, current_gap_position, current_gap_length, compared_kmer, kmer1_incidence, background_subtraction, scale_factor, kmer_length_difference_cutoff, original_kmer_length)) return 0;
+                
+                compared_kmer = lowmask_ULL[current_kmer_length-1] & ((current_kmer << 2) & highmask_ULL[current_kmer_length - true_gap_position]) | ((current_kmer) & (lowmask_ULL[current_kmer_length-true_gap_position-1]));
+                lowbit <<= 2; highbit <<= 2;
+            }
+        }
+        /* Different gap positions */
+                current_gap_length = true_gap_length;
+                if ((count_also_spaced_kmers == 2 || (count_also_spaced_kmers == 1 && current_kmer_length % 2 == 1)) && true_gap_length > 0) {
+                    current_gap_position = true_gap_position + 1;
+                    lowbit = 1; highbit = 2;
+                    lowbit <<= ((current_kmer_length - current_gap_position)*2); highbit <<= ((current_kmer_length - current_gap_position)*2);
+                    compared_kmer = (current_kmer & highmask_ULL[current_kmer_length - current_gap_position]) | ((current_kmer) & (lowmask_ULL[current_kmer_length-current_gap_position-1]));
+
+                    for(first_half = 0; first_half < 2; first_half++) {
+                        if (current_gap_position < current_kmer_length && current_gap_position > 0 && (count_also_spaced_kmers == 2 ||
+                            (count_also_spaced_kmers == 1 && ((current_gap_position == current_kmer_length / 2) || current_gap_position == current_kmer_length / 2 + 1)))) {
+                            
+                            if(check_kmer(results, file_number, current_kmer_length, current_gap_position, current_gap_length, compared_kmer, kmer1_incidence, background_subtraction, scale_factor, kmer_length_difference_cutoff, original_kmer_length)) return 0;
+                            compared_kmer = lowbit ^ compared_kmer;
+                            if(check_kmer(results, file_number, current_kmer_length, current_gap_position, current_gap_length, compared_kmer, kmer1_incidence, background_subtraction, scale_factor, kmer_length_difference_cutoff, original_kmer_length)) return 0;
+                            compared_kmer = highbit ^ compared_kmer;
+                            if(check_kmer(results, file_number, current_kmer_length, current_gap_position, current_gap_length, compared_kmer, kmer1_incidence, background_subtraction, scale_factor, kmer_length_difference_cutoff, original_kmer_length)) return 0;
+                            compared_kmer = lowbit ^ compared_kmer;
+                            if(check_kmer(results, file_number, current_kmer_length, current_gap_position, current_gap_length, compared_kmer, kmer1_incidence, background_subtraction, scale_factor, kmer_length_difference_cutoff, original_kmer_length)) return 0;
+                        }
+                        
+                        current_gap_position--;
+                        current_gap_position--;
+                        compared_kmer = ((current_kmer) & highmask_ULL[current_kmer_length - current_gap_position]) | ((current_kmer) & (lowmask_ULL[current_kmer_length-current_gap_position-1]));
+                        lowbit <<= 2; highbit <<= 2;
+                    }
+                }
+                
+                start = 1;
+                end = current_kmer_length;
+                
+                /* Compare ungapped kmer to all single gaps */
+                if (count_also_spaced_kmers != 0 && true_gap_length == 0) {
+                    if(count_also_spaced_kmers == 1) {
+                        start = current_kmer_length / 2;
+                        end = start + 1 + (current_kmer_length % 2);
+                    }
+                    
+                    for(current_gap_position = start, current_gap_length = 1; current_gap_position < end; current_gap_position++) {
+                        compared_kmer = (current_kmer & highmask_ULL[current_kmer_length - current_gap_position]) | ((current_kmer << 2) & (lowmask_ULL[current_kmer_length-current_gap_position-1]));
+                        
+                        for(lowbit = 1, highbit = 2, first_half = 0; first_half < 2; first_half++) {
+                            if(check_kmer(results, file_number, current_kmer_length, current_gap_position, current_gap_length, compared_kmer, kmer1_incidence, background_subtraction, scale_factor, kmer_length_difference_cutoff, original_kmer_length)) return 0;
+                            compared_kmer = lowbit ^ compared_kmer;
+                            if(check_kmer(results, file_number, current_kmer_length, current_gap_position, current_gap_length, compared_kmer, kmer1_incidence, background_subtraction, scale_factor, kmer_length_difference_cutoff, original_kmer_length)) return 0;
+                            compared_kmer = highbit ^ compared_kmer;
+                            if(check_kmer(results, file_number, current_kmer_length, current_gap_position, current_gap_length, compared_kmer, kmer1_incidence, background_subtraction, scale_factor, kmer_length_difference_cutoff, original_kmer_length)) return 0;
+                            compared_kmer = lowbit ^ compared_kmer;
+                            if(check_kmer(results, file_number, current_kmer_length, current_gap_position, current_gap_length, compared_kmer, kmer1_incidence, background_subtraction, scale_factor, kmer_length_difference_cutoff, original_kmer_length)) return 0;
+                            
+                            compared_kmer = ((current_kmer >> 2) & highmask_ULL[current_kmer_length - current_gap_position]) | ((current_kmer) & (lowmask_ULL[current_kmer_length-current_gap_position-1]));
+                            lowbit <<= ((current_kmer_length - 1)*2); highbit <<= ((current_kmer_length - 1)*2);
+                        }
+                    }
+                }
+            }
+
+            /* Compare with shorter kmer */
+            current_gap_position = true_gap_position;
+            current_gap_length = true_gap_length;
+            current_kmer_length--;
+            end = current_kmer_length;
+            if (current_kmer_length >= shortest_kmer) {
+                if(current_gap_length == 0) {
+                    if (count_also_spaced_kmers != 0) {
+                        if(count_also_spaced_kmers == 1) {
+                            start = current_kmer_length / 2;
+                            end = start + 1 + (current_kmer_length % 2);
+                        }
+                        for(current_gap_position = start, current_gap_length = 1; current_gap_position < end; current_gap_position++) {
+                            compared_kmer = ((current_kmer >> 2) & highmask_ULL[current_kmer_length - current_gap_position]) | ((current_kmer) & (lowmask_ULL[current_kmer_length-current_gap_position-1]));
+                            if(check_kmer(results, file_number, current_kmer_length, current_gap_position, current_gap_length, compared_kmer, kmer1_incidence, background_subtraction, scale_factor, kmer_length_difference_cutoff, original_kmer_length)) return 0;
+                        }
+                    }
+                }
+
+                current_gap_position = true_gap_position;
+                current_gap_length = true_gap_length;
+                
+                if (count_also_spaced_kmers != 1) {left = 1; right = 1;}
+                if (current_gap_position == current_kmer_length / 2 && current_kmer_length % 2 == 0 && count_also_spaced_kmers == 1) {left = 1; right = 0;}
+                if (current_kmer_length % 2 == 1 && count_also_spaced_kmers == 1) left = 1;
+                
+                /* Left part */
+                if (current_gap_position < current_kmer_length) {
+                    if (left == 1 || true_gap_length == 0) {
+                        compared_kmer = (current_kmer >> 2);
+                        if(check_kmer(results, file_number, current_kmer_length, current_gap_position, current_gap_length, compared_kmer, kmer1_incidence, background_subtraction, scale_factor, kmer_length_difference_cutoff, original_kmer_length)) return 0;
+                    }
+                }
+                
+                /* Right part */
+                if (current_gap_position != 1 && right == 1) {
+                    if (current_gap_position > 0) current_gap_position--;
+                    compared_kmer = (current_kmer & lowmask_ULL[current_kmer_length-1]);
+                    if(check_kmer(results, file_number, current_kmer_length, current_gap_position, current_gap_length, compared_kmer, kmer1_incidence, background_subtraction, scale_factor, kmer_length_difference_cutoff, original_kmer_length)) return 0;
+                }
+                
+                current_gap_position = true_gap_position;
+                
+                /* Shorter with longer gap */
+                if(count_also_spaced_kmers != 0 && true_gap_position != 0 && current_gap_length < MAX_GAP_LENGTH) {
+                    current_gap_length++;
+                    if (current_gap_position < current_kmer_length && left == 1) {
+                        compared_kmer = ((current_kmer >> 2) & highmask_ULL[current_kmer_length - current_gap_position]) | ((current_kmer) & (lowmask_ULL[current_kmer_length-current_gap_position-1]));
+                        if(check_kmer(results, file_number, current_kmer_length, current_gap_position, current_gap_length, compared_kmer, kmer1_incidence, background_subtraction, scale_factor, kmer_length_difference_cutoff, original_kmer_length)) return 0;
+                    }
+                    
+                    if(current_gap_position > 1 && right == 1) {
+                        current_gap_position--;
+                        compared_kmer = ((current_kmer >> 2) & highmask_ULL[current_kmer_length - current_gap_position]) | ((current_kmer) & (lowmask_ULL[current_kmer_length-current_gap_position-1]));
+                        if(check_kmer(results, file_number, current_kmer_length, current_gap_position, current_gap_length, compared_kmer, kmer1_incidence, background_subtraction, scale_factor, kmer_length_difference_cutoff, original_kmer_length)) return 0;
+                    }
+                    current_gap_length--;
+                    current_gap_position++;
+                }
+
+                /* Compare hanging single base to ungapped kmer */
+                current_gap_position = true_gap_position;
+                current_gap_length = true_gap_length;
+                if(current_gap_position == 1) {
+                    current_gap_length = 0;
+                    current_gap_position = 0;
+                    compared_kmer = (current_kmer & lowmask_ULL[current_kmer_length-1]);
+                    if(check_kmer(results, file_number, current_kmer_length, current_gap_position, current_gap_length, compared_kmer, kmer1_incidence, background_subtraction, scale_factor, kmer_length_difference_cutoff, original_kmer_length)) return 0;
+                }
+                else if(current_kmer_length-current_gap_position == 0) {
+                    current_gap_length = 0;
+                    current_gap_position = 0;
+                    compared_kmer = (current_kmer >> 2);
+                    if(check_kmer(results, file_number, current_kmer_length, current_gap_position, current_gap_length, compared_kmer, kmer1_incidence, background_subtraction, scale_factor, kmer_length_difference_cutoff, original_kmer_length)) return 0;
+                }
+            }
+
+            current_gap_position = true_gap_position;
+            current_gap_length = true_gap_length;
+            
+            /* Compare with longer kmer */
+            current_kmer_length++;
+            current_kmer_length++;
+            if (current_kmer_length < too_long_kmer) {
+                compared_kmer = (current_kmer << 2);
+                for(lowbit = 1, highbit = 2, first_half = 0; first_half < 2; first_half++) {
+                    if(count_also_spaced_kmers != 1 || true_gap_length == 0 ||
+                       (first_half == 1 || (count_also_spaced_kmers == 1 && current_gap_position == current_kmer_length / 2))) {
+                        
+                        if(check_kmer(results, file_number, current_kmer_length, current_gap_position, current_gap_length, compared_kmer, kmer1_incidence, background_subtraction, scale_factor, kmer_length_difference_cutoff, original_kmer_length)) return 0;
+                        compared_kmer = lowbit ^ compared_kmer;
+                        if(check_kmer(results, file_number, current_kmer_length, current_gap_position, current_gap_length, compared_kmer, kmer1_incidence, background_subtraction, scale_factor, kmer_length_difference_cutoff, original_kmer_length)) return 0;
+                        compared_kmer = highbit ^ compared_kmer;
+                        if(check_kmer(results, file_number, current_kmer_length, current_gap_position, current_gap_length, compared_kmer, kmer1_incidence, background_subtraction, scale_factor, kmer_length_difference_cutoff, original_kmer_length)) return 0;
+                        compared_kmer = lowbit ^ compared_kmer;
+                        if(check_kmer(results, file_number, current_kmer_length, current_gap_position, current_gap_length, compared_kmer, kmer1_incidence, background_subtraction, scale_factor, kmer_length_difference_cutoff, original_kmer_length)) return 0;
+                    }
+                    
+                    compared_kmer = current_kmer;
+                    lowbit <<= ((current_kmer_length - 1)*2); highbit <<= ((current_kmer_length - 1)*2);
+                    if (true_gap_length == 0) continue;
+                    current_gap_position++;
+                    if (current_gap_position > current_kmer_length || (count_also_spaced_kmers == 1 && current_gap_position != (current_kmer_length / 2 + (current_kmer_length % 2)))) break;
+                }
+                
+                current_gap_position = true_gap_position;
+                current_gap_length = true_gap_length;
+                /* Longer with shorter gap */
+                        if(count_also_spaced_kmers != 0 && true_gap_length >= 1) {
+                            current_gap_length--;
+                            lowbit = 1; highbit = 2;
+                            lowbit <<= ((current_kmer_length - current_gap_position-1)*2); highbit <<= ((current_kmer_length - current_gap_position-1)*2);
+                            compared_kmer = ((current_kmer << 2) & highmask_ULL[current_kmer_length - current_gap_position]) | ((current_kmer) & (lowmask_ULL[current_kmer_length-current_gap_position-1]));
+                            if (current_gap_length == 0) current_gap_position = 0;
+                            
+                            for(first_half = 0; first_half < 2; first_half++) {
+                                if (current_gap_position < current_kmer_length && (current_gap_position == 0 || Centergap (count_also_spaced_kmers, current_kmer_length, current_gap_position))) {
+                                    if(check_kmer(results, file_number, current_kmer_length, current_gap_position, current_gap_length, compared_kmer, kmer1_incidence, background_subtraction, scale_factor, kmer_length_difference_cutoff, original_kmer_length)) return 0;
+                                    compared_kmer = lowbit ^ compared_kmer;
+                                    if(check_kmer(results, file_number, current_kmer_length, current_gap_position, current_gap_length, compared_kmer, kmer1_incidence, background_subtraction, scale_factor, kmer_length_difference_cutoff, original_kmer_length)) return 0;
+                                    compared_kmer = highbit ^ compared_kmer;
+                                    if(check_kmer(results, file_number, current_kmer_length, current_gap_position, current_gap_length, compared_kmer, kmer1_incidence, background_subtraction, scale_factor, kmer_length_difference_cutoff, original_kmer_length)) return 0;
+                                    compared_kmer = lowbit ^ compared_kmer;
+                                    if(check_kmer(results, file_number, current_kmer_length, current_gap_position, current_gap_length, compared_kmer, kmer1_incidence, background_subtraction, scale_factor, kmer_length_difference_cutoff, original_kmer_length)) return 0;
+                                }
+                                
+                                current_gap_position++;
+                                if (current_gap_position > current_kmer_length || current_gap_position == 1) break;
+                                compared_kmer = ((current_kmer << 2) & highmask_ULL[current_kmer_length - current_gap_position]) | ((current_kmer) & (lowmask_ULL[current_kmer_length-current_gap_position-1]));
+                            }
+                            current_gap_length++;
+                        }
+                    }
+                    current_gap_position = true_gap_position;
+                    return 1;
+                }
+        
 /* SUBROUTINE THAT DETERMINES IF A GAPPED KMER IS A LOCAL MAXIMUM WITHIN HUDDINGE DISTANCE OF 1 */
 /* SEE NITTA ET AL. eLIFE 2015 Methods and Supplementary Figure 1 for algorithm description     */
 /* https://doi.org/10.7554/eLife.04837.004                                                      */
 /* Bases encoded as bits, A = 00, C = 01, G = 10, T = 11                                        */
 
-short int Localmax(long int *****results, short int file_number, short int current_kmer_length, short int shortest_kmer, short int longest_kmer_counted, short int current_gap_position, short int current_gap_length, long int current_kmer, double kmer_length_difference_cutoff)
+short int oldLocalmax(long int *****results, short int file_number, short int current_kmer_length, short int shortest_kmer, short int longest_kmer_counted, short int current_gap_position, short int current_gap_length, long int current_kmer, double kmer_length_difference_cutoff, short int noeffect, double another_noeffect)
 {
+
     short int count_also_spaced_kmers = 1;
     short int too_long_kmer = longest_kmer_counted + 1;
 
@@ -559,7 +1053,8 @@ short int Localmax(long int *****results, short int file_number, short int curre
     current_gap_position += shift;
     
     /* ONLY LOOK AT FULL SHIFT FOR UNGAPPED KMERS, OR FOR GAPPED KMERS IF GAP CAN SHIFT ALSO (ALL GAP POSITIONS HAVE BEEN COUNTED) */
-    if (current_gap_length == 0 || (count_also_spaced_kmers == 2 && current_gap_position < current_kmer_length) || (current_kmer_length % 2 == 1 && count_also_spaced_kmers == 1 && current_gap_position == current_kmer_length / 2 + 1))
+    // original :: if (current_gap_length == 0 || (count_also_spaced_kmers == 2 && current_gap_position < current_kmer_length) || (current_kmer_length % 2 == 1 && count_also_spaced_kmers == 1 && current_gap_position == current_kmer_length / 2 + 1))
+    if (current_gap_length == 0 || (count_also_spaced_kmers == 2 - SHIFTED_GAP_POSITIONS && current_gap_position < current_kmer_length) || (current_kmer_length % 2 == 1 && count_also_spaced_kmers == 1 && current_gap_position == current_kmer_length / 2 + 1)) // looks at
     {
     /* COMPARED FULL SHIFT RIGHT (same shift in gap if any), RETURNS 0 IF ANY KMER WITHIN HAMMING OF 1 HAS HIGHER COUNT  */
     compared_kmer = (current_kmer >> 2) & lowmask_ULL[current_kmer_length-1];
@@ -579,7 +1074,8 @@ short int Localmax(long int *****results, short int file_number, short int curre
     
     current_gap_position -= shift;
     current_gap_position -= shift;
-    if (current_gap_length == 0 || (count_also_spaced_kmers == 2 && current_gap_position > 0) || (current_kmer_length % 2 == 1 && count_also_spaced_kmers == 1 && current_gap_position == current_kmer_length / 2))
+    // if (current_gap_length == 0 || (count_also_spaced_kmers == 2 && current_gap_position > 0) || (current_kmer_length % 2 == 1 && count_also_spaced_kmers == 1 && current_gap_position == current_kmer_length / 2))
+    if (current_gap_length == 0 || (count_also_spaced_kmers == 2 - SHIFTED_GAP_POSITIONS && current_gap_position > 0) || (current_kmer_length % 2 == 1 && count_also_spaced_kmers == 1 && current_gap_position == current_kmer_length / 2))
     {
     /* COMPARED FULL SHIFT LEFT (same shift in gap if any) */
     compared_kmer = (current_kmer << 2) & lowmask_ULL[current_kmer_length-1];
@@ -941,37 +1437,6 @@ void GenerateMask ()
     for (highmask_ULL[Nlength-2] = mask_ULL[1][Nlength-2], position = Nlength-3; position > 0; position--) highmask_ULL[position] = highmask_ULL[position+1]+mask_ULL[1][position];
 }
 
-// LineBuffer structure to include 5D results
-typedef struct {
-    uint64_t***** results;  // 5D array [file][kmer_len][gap_pos][gap_len][kmer]
-    uint64_t* bitstream;
-    uint64_t* temp_bitstream;
-    int max_seq_length;
-    int file_index;
-    char finished;
-    pthread_mutex_t mutex;
-    pthread_cond_t not_full;
-    pthread_cond_t not_empty;
-    char** sequences;
-    size_t* seq_lengths;
-    int write_pos;
-    int read_pos;
-    int count;
-    int shortest_kmer;     // Add these
-    int longest_kmer;      // two fields
-    FILE* file;
-} LineBuffer;
-
-
-typedef struct PWMConsumerArgs {
-    LineBuffer* buffer;
-    struct normalized_pwm* signal_pwm;        // Input PWM for finding matches
-    struct normalized_pwm* background_pwm;     // Input background PWM for corrections
-    struct count_pwm* signal_output_pwm;      // Output PWM for signal counts
-    struct count_pwm* background_output_pwm;   // Output PWM for background counts
-    double cutoff;
-} PWMConsumerArgs;
-
 // Function declarations for externally defined functions
 // Function to encode a DNA character to 2-bit representation.
 uint64_t encode_base(char base) {
@@ -1174,6 +1639,7 @@ void count_kmers(uint64_t *results, uint64_t *bitstream, size_t sequence_length,
         // printf("DEBUG: Kmer %zu = %s from block %zu\n", counted_kmers, kmer_str, current_block - 1);
                              
         results[kmer]++;
+        results[1ULL << (2 * kmer_length)]++;  // Increment total at the end of the array
         counted_kmers++;
 
         // Shift bits
@@ -1218,27 +1684,46 @@ void count_kmers(uint64_t *results, uint64_t *bitstream, size_t sequence_length,
     // printf("DEBUG: Counted %zu kmers\n", counted_kmers);
 }
 
-uint64_t***** allocate_5d_results(int shortest_kmer, int longest_kmer) {
+uint64_t***** allocate_5d_results(int shortest_kmer, int longest_kmer, int broader_gaps) {
     uint64_t***** results = malloc(NUM_FILES * sizeof(uint64_t****));
     
     for (int f = 0; f < NUM_FILES; f++) {
-        // Allocate for all kmers in range
         results[f] = malloc((longest_kmer + 1) * sizeof(uint64_t***));
         
         for (int k = shortest_kmer; k <= longest_kmer; k++) {
             if (k <= 0) continue;
             
-            // Calculate exact size needed for this kmer length
             uint64_t total_kmers = 1ULL << (2 * k);
             
-            // Calculate center positions for this k-mer length
-            int center1, center2;
-            if (k % 2 == 0) {
-                center1 = k / 2;
-                center2 = -1;  // No second center for even length
+            // Calculate center positions
+            int centers[4] = {-1, -1, -1, -1};  // Store up to 4 centers
+            int num_centers = 0;
+            
+            if (broader_gaps && k > 3) {
+                if (k % 2 == 0) {
+                    // For even length, allocate 3 center positions
+                    centers[0] = (k / 2) - 1;  // Left of center
+                    centers[1] = k / 2;        // Center
+                    centers[2] = (k / 2) + 1;  // Right of center
+                    num_centers = 3;
+                } else {
+                    // For odd length, allocate 4 center positions
+                    centers[0] = ((k - 1) / 2) - 1;  // Left of centers
+                    centers[1] = (k - 1) / 2;        // First center
+                    centers[2] = ((k - 1) / 2) + 1;  // Second center
+                    centers[3] = ((k - 1) / 2) + 2;  // Right of centers
+                    num_centers = 4;
+                }
             } else {
-                center1 = (k - 1) / 2;
-                center2 = center1 + 1;
+                // Original behavior
+                if (k % 2 == 0) {
+                    centers[0] = k / 2;
+                    num_centers = 1;
+                } else {
+                    centers[0] = (k - 1) / 2;
+                    centers[1] = ((k - 1) / 2) + 1;
+                    num_centers = 2;
+                }
             }
             
             // Allocate array for gap positions
@@ -1248,34 +1733,26 @@ uint64_t***** allocate_5d_results(int shortest_kmer, int longest_kmer) {
             }
             
             // Allocate position 0 for ungapped kmers
-            results[f][k][0] = malloc(sizeof(uint64_t*));  // Only need index 0
-            results[f][k][0][0] = calloc(total_kmers, sizeof(uint64_t));
+            results[f][k][0] = malloc(sizeof(uint64_t*));
+            results[f][k][0][0] = calloc(total_kmers + 1, sizeof(uint64_t));  // +1 for total at the end
             if (!results[f][k][0][0]) {
                 fprintf(stderr, "Failed to allocate memory for ungapped kmers at k=%d (size=%llu)\n",
                         k, total_kmers);
                 exit(1);
             }
             
-            // Allocate first center position
-            results[f][k][center1] = malloc((MAX_GAP_LENGTH + 1) * sizeof(uint64_t*));
-            for (int l = 1; l <= MAX_GAP_LENGTH; l++) {  // Start from 1 for gaps
-                results[f][k][center1][l] = calloc(total_kmers, sizeof(uint64_t));
-                if (!results[f][k][center1][l]) {
-                    fprintf(stderr, "Failed to allocate memory for gapped kmers at k=%d, center=%d, gap=%d (size=%llu)\n",
-                            k, center1, l, total_kmers);
-                    exit(1);
-                }
-            }
-            
-            // Allocate second center position if needed (odd length)
-            if (center2 != -1) {
-                results[f][k][center2] = malloc((MAX_GAP_LENGTH + 1) * sizeof(uint64_t*));
-                for (int l = 1; l <= MAX_GAP_LENGTH; l++) {  // Start from 1 for gaps
-                    results[f][k][center2][l] = calloc(total_kmers, sizeof(uint64_t));
-                    if (!results[f][k][center2][l]) {
-                        fprintf(stderr, "Failed to allocate memory for gapped kmers at k=%d, center=%d, gap=%d (size=%llu)\n",
-                                k, center2, l, total_kmers);
-                        exit(1);
+            // Allocate memory for each center position
+            for (int i = 0; i < num_centers; i++) {
+                int center = centers[i];
+                if (center != -1) {
+                    results[f][k][center] = malloc((MAX_GAP_LENGTH + 1) * sizeof(uint64_t*));
+                    for (int l = 1; l <= MAX_GAP_LENGTH; l++) {
+                        results[f][k][center][l] = calloc(total_kmers + 1, sizeof(uint64_t));  // +1 for total at the end
+                        if (!results[f][k][center][l]) {
+                            fprintf(stderr, "Failed to allocate memory for gapped kmers at k=%d, center=%d, gap=%d (size=%llu)\n",
+                                    k, center, l, total_kmers);
+                            exit(1);
+                        }
                     }
                 }
             }
@@ -1373,6 +1850,180 @@ void destroy_buffer(LineBuffer* buffer) {
     fclose(buffer->file);
 }
 
+// Calculate information content (2-entropy) from array of 4 frequencies
+double calculate_position_ic(double freqs[4]) {
+   double ic = 0.0;
+   for(int i = 0; i < 4; i++) {
+       if(freqs[i] > 0) {
+           ic -= freqs[i] * log2(freqs[i]);
+       }
+   }
+   return 2.0 - ic;
+}
+
+double calculate_position_variance(const uint64_t counts[4])
+{
+    // Number of data points
+    const int n = 4;
+
+    // 1) Compute the mean of all four values
+    double sum = 0.0;
+    for (int i = 0; i < n; i++) {
+        sum += (double)counts[i];
+    }
+    double mean = sum / (double)n;
+
+    // 2) Sum up the squared differences from the mean
+    double var_sum = 0.0;
+    for (int i = 0; i < n; i++) {
+        double diff = (double)counts[i] - mean;
+        var_sum += diff * diff;
+    }
+
+    // 3) Sample variance = var_sum / (n - 1)
+    //    Sample standard deviation = sqrt(sample variance)
+    if (n > 1) {
+        double sample_variance = var_sum / (double)(n);
+        return sqrt(sample_variance);
+    } else {
+        // In a degenerate case (n <= 1), just return 0
+        return 0.0;
+    }
+}
+
+void print_kmer_statistics(uint64_t***** results, int file_number, int kmer_length,
+                        int gap_position, int gap_length, uint64_t kmer) {
+   // Original kmer count
+    //return;
+    
+   uint64_t orig_count = results[file_number][kmer_length][gap_position][gap_length][kmer];
+   
+   // 1. Calculate shift ratios - only for ungapped kmers
+   uint64_t left_count = 0;
+   uint64_t right_count = 0;
+   double shift_ratio = 0.0;
+
+    if (kmer_length < 4) shift_ratio = -1;
+    else if (orig_count > 0) {  // Handle both gapped and ungapped kmers
+        uint64_t max_count = 0;
+        
+        // Print original kmer and count
+        // printf("\nOriginal: ");
+        // Kmerprint(kmer, kmer_length, gap_position, gap_length);
+        // printf(" Count: %lu", orig_count);
+
+        // --- LEFT SHIFT (drop rightmost base) ---
+        uint64_t shifted_kmer_l = kmer >> 2;
+        for (int base = 0; base < 4; base++) {
+            uint64_t candidate =
+                ((uint64_t)base << (2 * (kmer_length - 1)))  // new leftmost base
+                | shifted_kmer_l;                            // the remaining (k-1) bases
+
+            uint64_t count_candidate;
+            if (gap_length == 0) {
+                count_candidate = results[file_number][kmer_length][0][0][candidate];
+            } else {
+                // For left shift, gap position moves right by 1
+                count_candidate = results[file_number][kmer_length][gap_position + 1][gap_length][candidate];
+            }
+            
+            // Print left-shifted candidate
+            // printf("\nLeft shift: ");
+            // if (gap_length == 0) Kmerprint(candidate, kmer_length, 0, 0);
+            // else Kmerprint(candidate, kmer_length, gap_position + 1, gap_length);
+            // printf(" Count: %lu", count_candidate);
+            
+            if (count_candidate > max_count) {
+                max_count = count_candidate;
+            }
+        }
+
+        // --- RIGHT SHIFT (drop leftmost base) ---
+        uint64_t shifted_kmer_r =
+            (kmer & ((1ULL << (2ULL * (kmer_length - 1))) - 1ULL)) << 2;
+
+        for (int base = 0; base < 4; base++) {
+            uint64_t candidate = shifted_kmer_r | (uint64_t)base;
+            
+            uint64_t count_candidate;
+            if (gap_length == 0) {
+                count_candidate = results[file_number][kmer_length][0][0][candidate];
+            } else {
+                // For right shift, gap position moves left by 1
+                count_candidate = results[file_number][kmer_length][gap_position - 1][gap_length][candidate];
+            }
+            
+            // Print right-shifted candidate
+            // printf("\nRight shift: ");
+            // if (gap_length == 0) Kmerprint(candidate, kmer_length, 0, 0);
+            // else Kmerprint(candidate, kmer_length, gap_position - 1, gap_length);
+            // printf(" Count: %lu", count_candidate);
+            
+            if (count_candidate > max_count) {
+                max_count = count_candidate;
+            }
+        }
+
+        // printf("\nMax shifted count: %lu\n", max_count);
+        shift_ratio = (double)max_count / (double)orig_count;
+    }
+   
+   // 2. Calculate IC and position-specific variance
+   double total_ic = 0.0;
+   double total_var = 0.0;
+   int valid_positions = 0;
+   
+   // For each position
+   for(int pos = 0; pos < kmer_length; pos++) {
+       // Get counts for consensus and mutations at this position
+       uint64_t pos_counts[4] = {0};  // A,C,G,T counts
+       
+       int shift = 2 * pos;
+       
+       // Get counts for consensus and all mutations at this position
+       uint64_t base_mask = ~(3ULL << shift);
+       for(int base = 0; base < 4; base++) {
+           uint64_t mut_kmer = (kmer & base_mask) | ((uint64_t)base << shift);
+           pos_counts[base] = results[file_number][kmer_length][gap_position][gap_length][mut_kmer];
+       }
+       
+       // Calculate frequencies for IC
+       double total = 0.0;
+       double freqs[4] = {0.0};
+       for(int i = 0; i < 4; i++) {
+           total += (double)pos_counts[i];
+       }
+       if(total > 0.0) {
+           for(int i = 0; i < 4; i++) {
+               freqs[i] = (double)pos_counts[i]/total;
+           }
+       }
+       
+       total_ic += calculate_position_ic(freqs);
+       total_var += calculate_position_variance(pos_counts);
+       valid_positions++;
+   }
+   
+   double avg_variance = valid_positions > 0 ? total_var/(double)valid_positions : 0.0;
+   double exp_variance = sqrt((double)orig_count);  // Expected Poisson variance
+   if (exp_variance == 0) exp_variance = 0.001;
+    
+   // Print tab-separated statistics
+    if (shift_ratio < 0) {
+        printf("\tNA\t%.3lf\t%.2lf%%\t%.2lf%%\t%.2lf%%",
+               total_ic,
+               100 * avg_variance/orig_count,
+               100 * exp_variance/orig_count,
+               100 * avg_variance/orig_count - 100 * exp_variance/orig_count);
+    } else {
+        printf("\t%.3lf\t%.3lf\t%.2lf%%\t%.2lf%%\t%.2lf%%",
+               shift_ratio, total_ic,
+               100 * avg_variance/orig_count,
+               100 * exp_variance/orig_count,
+               100 * avg_variance/orig_count - 100 * exp_variance/orig_count);
+    }
+}
+
 // PRODUCER TO GENERATE LINE BUFFER FOR CONSUMERS
 void* producer(void* arg) {
     LineBuffer* buffer = (LineBuffer*)arg;
@@ -1423,6 +2074,7 @@ void* producer(void* arg) {
 }
 
 // CONSUMER FOR PWM GENERATION
+// CONSUMER FOR PWM GENERATION
 void* PWM_generator_consumer(void* arg) {
    PWMConsumerArgs* args = (PWMConsumerArgs*)arg;
    LineBuffer* buffer = args->buffer;
@@ -1430,10 +2082,9 @@ void* PWM_generator_consumer(void* arg) {
    struct match matches;
    struct count_pwm count_pwms[2];
    
+   // initializes matches and count pwm for this file
    match_init(&matches, args->signal_pwm->width);
-   for (int i = 0; i < 2; i++) {
-       count_pwm_init(&count_pwms[i], args->signal_pwm->name, args->signal_pwm->width, 0.0);
-   }
+   count_pwm_init(&count_pwms[buffer->file_index], "pwm", args->signal_pwm->width, 0.0);
 
    // Calculate proper allocation size based on MAX_SEQ_LENGTH
    size_t num_blocks = (MAX_SEQ_LEN + 31) / 32;
@@ -1448,12 +2099,122 @@ void* PWM_generator_consumer(void* arg) {
        return NULL;
    }
 
+   // Get kmer length from args
+   int kmer_length = args->kmer_length;
+
    while (1) {
        pthread_mutex_lock(&buffer->mutex);
        
        while (buffer->count == 0) {
            if (buffer->finished) {
                pthread_mutex_unlock(&buffer->mutex);
+               
+               // Calculate enrichment before returning - do this only once when processing is finished
+               if (buffer->file_index == 1) { // Only do this once in signal file processing
+                   size_t kmer_count_size = (1ULL << (2 * kmer_length));
+                   
+                   // Calculate total counts for normalization
+                   uint64_t total_bg = 0;
+                   uint64_t total_sig = 0;
+                   
+                   for (size_t i = 0; i < kmer_count_size; i++) {
+                       total_bg += args->kmer_counts[0][i];
+                       total_sig += args->kmer_counts[1][i];
+                   }
+                   
+                   // Only proceed if we have counts
+                   if (total_bg > 0 && total_sig > 0) {
+                       // We need to sort arrays with the actual counts, not indices
+                       uint64_t* bg_sorted = (uint64_t*)malloc(kmer_count_size * sizeof(uint64_t));
+                       uint64_t* sig_sorted = (uint64_t*)malloc(kmer_count_size * sizeof(uint64_t));
+                       
+                       if (bg_sorted && sig_sorted) {
+                           // Copy counts to sortable arrays
+                           for (size_t i = 0; i < kmer_count_size; i++) {
+                               bg_sorted[i] = args->kmer_counts[0][i];
+                               sig_sorted[i] = args->kmer_counts[1][i];
+                           }
+                           
+                           // Sort the arrays of counts directly
+                           qsort(bg_sorted, kmer_count_size, sizeof(uint64_t), compare_counts);
+                           qsort(sig_sorted, kmer_count_size, sizeof(uint64_t), compare_counts);
+                           
+                           // Calculate quartiles (each quartile is 25% of the data)
+                           size_t quartile_size = kmer_count_size / 4;
+                           
+                           // Extract the two middle quartiles (25%-75%)
+                           size_t middle_start = quartile_size;
+                           size_t middle_end = 3 * quartile_size;
+                           
+                           // Sum the counts for the middle quartiles
+                           uint64_t bg_middle_sum = 0;
+                           uint64_t sig_middle_sum = 0;
+                           for (size_t i = middle_start; i < middle_end; i++) {
+                               bg_middle_sum += bg_sorted[i];
+                               sig_middle_sum += sig_sorted[i];
+                           }
+                           
+                           // Calculate lambda (protect against division by zero)
+                           double lambda = 1.0; // Default to 1.0 (no correction) if we can't calculate
+                           
+                           if (args->background_output_pwm->enrichment) lambda = args->background_output_pwm->enrichment;
+                           else {
+                               if (bg_middle_sum > 0 && total_bg > 0 && total_sig > 0) {
+                                   double bg_fraction = (double)bg_middle_sum / total_bg;
+                                   double sig_fraction = (double)sig_middle_sum / total_sig;
+                                   
+                                   if (bg_fraction > 0) {
+                                       lambda = sig_fraction / bg_fraction;
+                                       //printf("\nLambda = %.2f, center fraction: %.2f, %.2f, middle %llu,%llu, total %llu,%llu", lambda, bg_fraction, sig_fraction, bg_middle_sum, sig_middle_sum, total_bg, total_sig);
+                                   }
+                               }
+                           }
+                           
+                           // Simple safety check - if lambda is extreme, use a reasonable value
+                           if (lambda <= 0.0 || lambda > 10.0) {
+                               lambda = 1.0;
+                           }
+                           
+                           // Calculate sizefactor from total kmer counts
+                           // This matches the original code: sizefactor = number_of_sequences_analyzed[0] / number_of_sequences_analyzed[1]
+                           // In our case, total_bg and total_sig are proportional to sequences
+                           double sizefactor = 1.0; // Default
+                           if (total_sig > 0) {
+                               sizefactor = (double)total_bg / total_sig;
+                               //lambda = (double) (sig_middle_sum * total_bg) / (double) (bg_middle_sum * total_sig);
+                               //printf("\nLambda = %.2f", lambda);
+                           }
+                           
+                           // Apply background correction to signal PWM exactly as in the provided code
+                           if (args->signal_output_pwm && args->background_output_pwm) {
+                               for (int i = 0; i < args->signal_output_pwm->width; i++) {
+                                   for (int j = 0; j < 4; j++) {
+                                       // Apply the exact formula from the provided code:
+                                       // corrected = (signal * sizefactor) - (lambda * background)
+                                       double signal_val = args->signal_output_pwm->incidence[j][i];
+                                       double bg_val = args->background_output_pwm->incidence[j][i];
+                                       
+                                       double corrected = (signal_val * sizefactor) - (lambda * bg_val);
+                                       // Zero out any negative values
+                                       args->signal_output_pwm->incidence[j][i] = corrected > 0 ? corrected : 0;
+                                   }
+                               }
+                           }
+                           
+                           // Store lambda in the PWM structure for reporting
+                           if (args->signal_output_pwm) {
+                               args->signal_output_pwm->enrichment=lambda;
+                           }
+                           if (args->background_output_pwm) {
+                               args->background_output_pwm->enrichment=lambda;
+                           }
+                           
+                           free(bg_sorted);
+                           free(sig_sorted);
+                       }
+                   }
+               }
+               
                free(local_bitstream);
                free(local_temp_bitstream);
                return NULL;
@@ -1467,13 +2228,10 @@ void* PWM_generator_consumer(void* arg) {
        
        // Add validation HERE, before any processing
        if (!sequence || seq_length == 0) {
-           printf("\nSkipping empty sequence at position %d", buffer->read_pos);
            pthread_mutex_unlock(&buffer->mutex);
            line_count++;
            continue;
        }
-       
-       //printf("\nDebug - Processing sequence (len=%zu): '%s'", seq_length, sequence);
        
        buffer->read_pos = (buffer->read_pos + 1) % BUFFER_SIZE;
        buffer->count--;
@@ -1484,7 +2242,6 @@ void* PWM_generator_consumer(void* arg) {
        memset(local_bitstream, 0, num_blocks * sizeof(uint64_t));
        
        if (encode_dna_sequence(sequence, local_bitstream, &bitstream_length) == 0) {
-           printf("\nError in DNA sequence on line %li, sequence rejected", line_count);
            pthread_mutex_unlock(&buffer->mutex);
            line_count++;
            continue;
@@ -1493,8 +2250,41 @@ void* PWM_generator_consumer(void* arg) {
        pthread_mutex_unlock(&buffer->mutex);
        line_count++;
 
+       __atomic_fetch_add((size_t*)&(args->total_reads[buffer->file_index]), 1, __ATOMIC_SEQ_CST);
+       
+       // Count kmers in forward strand for ALL reads (if sequence length is sufficient)
+       if (seq_length >= kmer_length) {
+           // Call count_kmers function with gap of 0 and gap length of 0
+           count_kmers(args->kmer_counts[buffer->file_index],
+                      local_bitstream,
+                      seq_length,
+                      kmer_length,
+                      0,  // gap_position
+                      0); // gap_length
+       }
+       
+       // Create reverse complement for ALL reads
+       reverse_complement_bitstream(local_bitstream, local_temp_bitstream, seq_length);
+       
+       // Count kmers in reverse complement strand for ALL reads
+       if (seq_length >= kmer_length) {
+           count_kmers(args->kmer_counts[buffer->file_index],
+                      local_temp_bitstream,
+                      seq_length,
+                      kmer_length,
+                      0,  // gap_position
+                      0); // gap_length
+       }
+       
+       // Check for PWM matches in forward strand
        if (Findpwmmatch_from_bitstream(args->signal_pwm, args->cutoff,
                                      local_bitstream, seq_length, &matches)) {
+           
+           // Increments match counts
+           __atomic_fetch_add((size_t*)&(args->matched_reads[buffer->file_index]),
+                             matches.position[0],
+                             __ATOMIC_SEQ_CST);
+           
            for (int i = 1; i <= matches.position[0]; i++) {
                struct count_pwm* output_pwm = (buffer->file_index == 0) ?
                    args->background_output_pwm : args->signal_output_pwm;
@@ -1510,26 +2300,30 @@ void* PWM_generator_consumer(void* arg) {
                    seq_length,
                    args->background_pwm);
            }
-
-           reverse_complement_bitstream(local_bitstream, local_temp_bitstream, seq_length);
+       }
        
-           if (Findpwmmatch_from_bitstream(args->signal_pwm, args->cutoff,
-                                         local_bitstream, seq_length, &matches)) {
-               for (int i = 1; i <= matches.position[0]; i++) {
-                   struct count_pwm* output_pwm = (buffer->file_index == 0) ?
-                       args->background_output_pwm : args->signal_output_pwm;
-                   
-                   Multinomial_add_to_pwm_from_bitstream(
-                       output_pwm,
-                       args->signal_pwm,
-                       matches.position[i],
-                       matches.score[i],
-                       args->cutoff,
-                       local_bitstream,
-                       local_temp_bitstream,
-                       seq_length,
-                       args->background_pwm);
-               }
+       // Check for PWM matches in reverse complement strand
+       if (Findpwmmatch_from_bitstream(args->signal_pwm, args->cutoff,
+                                     local_temp_bitstream, seq_length, &matches)) {
+           
+           __atomic_fetch_add((size_t*)&(args->matched_reads[buffer->file_index]),
+                             matches.position[0],
+                             __ATOMIC_SEQ_CST);
+           
+           for (int i = 1; i <= matches.position[0]; i++) {
+               struct count_pwm* output_pwm = (buffer->file_index == 0) ?
+                   args->background_output_pwm : args->signal_output_pwm;
+               
+               Multinomial_add_to_pwm_from_bitstream(
+                   output_pwm,
+                   args->signal_pwm,
+                   matches.position[i],
+                   matches.score[i],
+                   args->cutoff,
+                   local_temp_bitstream,
+                   local_bitstream,  // Note: bitstreams are swapped here
+                   seq_length,
+                   args->background_pwm);
            }
        }
    }
@@ -1539,12 +2333,12 @@ void* PWM_generator_consumer(void* arg) {
    return NULL;
 }
 
+
 // CONSUMER FOR KMER COUNTING
 void* consumer(void* arg) {
     LineBuffer* buffer = (LineBuffer*)arg;
     size_t line_count = 1;
     
-    // printf("Consumer: Starting\n");
     while (1) {
         pthread_mutex_lock(&buffer->mutex);
         
@@ -1564,12 +2358,10 @@ void* consumer(void* arg) {
         
         pthread_cond_signal(&buffer->not_full);
 
-        // Keep mutex locked during sequence processing
-        size_t bitstream_length;
+        size_t bitstream_length;  // Added declaration here
         memset(buffer->bitstream, 0, 64 * sizeof(uint64_t));
         
-        if (encode_dna_sequence(sequence, buffer->bitstream, &bitstream_length) == 0)
-        {
+        if (encode_dna_sequence(sequence, buffer->bitstream, &bitstream_length) == 0) {
             printf("\nError in DNA sequence on line %li, sequence rejected", line_count);
             pthread_mutex_unlock(&buffer->mutex);
             line_count++;
@@ -1578,12 +2370,9 @@ void* consumer(void* arg) {
         
         pthread_mutex_unlock(&buffer->mutex);
         line_count++;
-
+        
         // COUNT KMERS
-        for(int strand = 0; strand < 2; strand++)
-        {
-            
-            
+        for(int strand = 0; strand < 2; strand++) {
             // Process ungapped kmers within valid range
             for (int k = buffer->shortest_kmer; k <= buffer->longest_kmer; k++) {
                 if (k <= 0) continue;
@@ -1598,59 +2387,57 @@ void* consumer(void* arg) {
             for (int k = buffer->shortest_kmer; k <= buffer->longest_kmer; k++) {
                 if (k <= 0) continue;
                 
-                // printf("DEBUG: Processing k=%d\n", k);
-                
-                // Calculate gap positions based on kmer length
+                // Calculate gap positions based on kmer length and broader_gaps setting
+                int gap_positions[4] = {-1, -1, -1, -1};  // Up to 4 positions
                 int number_of_gap_positions;
-                int gap_positions[2];
                 
-                if (k % 2 == 0) {
-                    number_of_gap_positions = 1;
-                    gap_positions[0] = k/2;
-                    // printf("DEBUG: Even length kmer, gap position at %d\n", gap_positions[0]);
+                if (SHIFTED_GAP_POSITIONS && k > 3) {
+                    if (k % 2 == 0) {
+                        // For even length, use 3 positions
+                        number_of_gap_positions = 3;
+                        gap_positions[0] = (k/2) - 1;  // Left of center
+                        gap_positions[1] = k/2;        // Center
+                        gap_positions[2] = (k/2) + 1;  // Right of center
+                    } else {
+                        // For odd length, use 4 positions
+                        number_of_gap_positions = 4;
+                        gap_positions[0] = ((k-1)/2) - 1;  // Left of centers
+                        gap_positions[1] = (k-1)/2;        // First center
+                        gap_positions[2] = ((k-1)/2) + 1;  // Second center
+                        gap_positions[3] = ((k-1)/2) + 2;  // Right of centers
+                    }
                 } else {
-                    number_of_gap_positions = 2;
-                    gap_positions[0] = k/2;
-                    gap_positions[1] = k/2 + 1;
-                    // printf("DEBUG: Odd length kmer, gap positions at %d and %d\n",
-                    //        gap_positions[0], gap_positions[1]);
+                    // Original behavior
+                    if (k % 2 == 0) {
+                        number_of_gap_positions = 1;
+                        gap_positions[0] = k/2;
+                    } else {
+                        number_of_gap_positions = 2;
+                        gap_positions[0] = k/2;
+                        gap_positions[1] = k/2 + 1;
+                    }
                 }
                 
                 // For each gap position
                 for (int i = 0; i < number_of_gap_positions; i++) {
                     int gap_pos = gap_positions[i];
-                    // printf("DEBUG: Processing gap position %d\n", gap_pos);
+                    if (gap_pos == -1) continue;  // Skip invalid positions
                     
                     // For each gap length (1-10)
-                    for (int gap_len = 1; gap_len <= 10; gap_len++) {
+                    for (int gap_len = 1; gap_len <= MAX_GAP_LENGTH; gap_len++) {
                         // Skip if kmer + gap would be longer than sequence
-                        if (k + gap_len > seq_length) {
-                            // printf("DEBUG: Skipping k=%d gap_len=%d (total %d > seq_length %zu)\n",
-                            //        k, gap_len, k + gap_len, seq_length);
-                            continue;
-                        }
-                        
-                        // printf("DEBUG: Processing gap length %d\n", gap_len);
+                        if (k + gap_len > seq_length) continue;
                         
                         if (buffer->results[buffer->file_index][k][gap_pos] &&
                             buffer->results[buffer->file_index][k][gap_pos][gap_len]) {
-                            
-                            // uint64_t array_size = 1ULL << (2 * k);
-                            // printf("DEBUG: Result array size for k=%d: %" PRIu64 " entries (%" PRIu64 " bytes)\n",
-                            //        k, array_size, array_size * sizeof(uint64_t));
-                            
                             count_kmers(buffer->results[buffer->file_index][k][gap_pos][gap_len],
-                                        buffer->bitstream, seq_length, k, gap_pos, gap_len);
-                            
-                            // printf("DEBUG: Finished counting for k=%d gap_pos=%d gap_len=%d\n",
-                            //        k, gap_pos, gap_len);
+                                      buffer->bitstream, seq_length, k, gap_pos, gap_len);
                         }
                     }
                 }
             }
             reverse_complement_bitstream(buffer->bitstream, buffer->temp_bitstream, seq_length);
         }
-        // printf("Consumer: Finished processing sequence\n\n");
     }
 }
 
@@ -1658,7 +2445,7 @@ void* consumer(void* arg) {
 void print_kmers_single_config(uint64_t***** results, int file, int kmer_len,
                              int shortest_kmer, int longest_kmer,
                              int gap_pos, int gap_len, double threshold,
-                             int only_local_max, double length_diff_cutoff) {
+                             int only_local_max, int background_correction, double length_diff_cutoff) {
     char* kmer_str = malloc(kmer_len + MAX_GAP_LENGTH + 1);
     if (!kmer_str) return;
     
@@ -1676,13 +2463,23 @@ void print_kmers_single_config(uint64_t***** results, int file, int kmer_len,
 
         if (signal_count >= threshold) {
             short int is_localmax = Localmax((long int*****)results,
-                                           1, kmer_len,
-                                           shortest_kmer, longest_kmer,
-                                           gap_pos, gap_len, kmer,
-                                           length_diff_cutoff);
+                                        1, kmer_len,
+                                        shortest_kmer, longest_kmer,
+                                        gap_pos, gap_len, kmer,
+                                        length_diff_cutoff,
+                                        background_correction,
+                                        (double)results[1][kmer_len][gap_pos][gap_len][1ULL << (2 * kmer_len)] /
+                                        (double)results[0][kmer_len][gap_pos][gap_len][1ULL << (2 * kmer_len)]);
             decode_kmer(kmer, kmer_len, gap_pos, gap_len, kmer_str);
-            if (!only_local_max || is_localmax == 1) printf("%s\t%i\t%i\t%" PRIu64 "\t%" PRIu64, kmer_str, gap_pos, gap_len, background_count, signal_count);
-            if (is_localmax) printf ("\tLocalmax");
+            if (!only_local_max || is_localmax == 1) {
+               printf("%s\t%i\t%i\t%" PRIu64 "\t%" PRIu64, kmer_str, gap_pos, gap_len, background_count, signal_count);
+               if (is_localmax) {
+                   printf("\tLocalmax");
+                   // Add statistics for local maxima
+                   print_kmer_statistics(results, 1, kmer_len, gap_pos, gap_len, kmer);
+               }
+               //printf("\n");
+            }
             if (!only_local_max || is_localmax == 1) printf("\n");
             }
         }
@@ -1691,11 +2488,13 @@ void print_kmers_single_config(uint64_t***** results, int file, int kmer_len,
 
 int main(int argc, char* argv[]) {
     
-    
     clock_t start = clock();
     
     short int max_seed_length = 20;
     short int count_kmers = 0;
+    short int background_correction = 1;  // Default is to use background correction
+    int kmer_length = 8;                 // Default kmer length
+    double cmd_lambda = 0;              // Default: use calculated lambda value
     uint64_t***** results;
     double threshold;
     double length_diff_cutoff;
@@ -1711,14 +2510,27 @@ int main(int argc, char* argv[]) {
     normalized_pwm_init(&qp, "pwm_for_multinomial", max_seed_length, 0);
     struct count_pwm count_pwms[2];
     
-    if (argc != 4 && argc != 5 && argc != 6 && argc != 7) {
+    if (argc < 4 || argc > 10) {
         fprintf(stderr, "Usage for kmer counting and local maxima detection: \n\t%s <background_file> <signal_file> <shortest_kmer_length> <longest_kmer_length> [count threshold for printing] [length_diff_cutoff]\n", argv[0]);
         fprintf(stderr, "\tlength_diff_cutoff: Optional parameter for setting the length difference cutoff for local maxima detection (default: 0.35 = longer kmer must have at least 35%% of the counts of the shorter one to be local max)\n");
-        fprintf(stderr, "\nUsage for generating a PWM motif using a seed: \n\t%s <background_file> <signal_file> <IUPAC seed> <multinomial> [lambda]\n", argv[0]);
-        fprintf(stderr, "\tmultinomial sets how many mismatches are allowed in kmers that contribute to motif, lambda defines non-specific carryover for background correction (not implemented in this version, motif shown is from signal, all matches, uncorrected)\n");
+        fprintf(stderr, "\nUsage for generating a PWM motif using a seed: \n\t%s <background_file> <signal_file> <IUPAC seed> <multinomial> [lambda] [-kl=<kmer_length>] [-noback] [-lambda=<lambda_value>]\n", argv[0]);
+        fprintf(stderr, "\tmultinomial sets how many mismatches are allowed in kmers that contribute to motif\n");
+        fprintf(stderr, "\t-kl=<kmer_length>: Optional parameter to set the k-mer length (default: 8)\n");
+        fprintf(stderr, "\t-noback: Optional parameter to disable background correction\n");
+        fprintf(stderr, "\t-lambda=<lambda_value>: Optional parameter to set lambda value manually\n");
         return 1;
     }
 
+    // Parse optional arguments
+    for (int i = 3; i < argc; i++) {
+        if (strncmp(argv[i], "-kl=", 4) == 0) {
+            kmer_length = atoi(argv[i] + 4);
+        } else if (strcmp(argv[i], "-noback") == 0) {
+            background_correction = 0;
+        } else if (strncmp(argv[i], "-lambda=", 8) == 0) {
+            cmd_lambda = atof(argv[i] + 8);
+        }
+    }
 
     char* filenames[NUM_FILES] = {argv[1], argv[2]};
     shortest_kmer = atoi(argv[3]);
@@ -1727,7 +2539,7 @@ int main(int argc, char* argv[]) {
     // IF THIRD ARGUMENT IS A STRING, PARSES MOTIF GENERATION ARGUMENTS
     if (shortest_kmer == 0) {
         multinomial = atoi(argv[4]);
-        lambda = atof(argv[5]);
+        lambda = (argc > 5 && argv[5][0] != '-') ? atof(argv[5]) : 0.0;
         strncpy(seed, argv[3], 20);
         Iupac_to_pwm(&qp, seed);
         //printf("\nMotif generation started with multinomial %i and lambda = %f", multinomial, lambda);
@@ -1742,12 +2554,15 @@ int main(int argc, char* argv[]) {
         // ELSE PARSES LOCAL MAX ARGUMENTS AND COUNTS KMERS
         count_kmers = 1;
         longest_kmer = atoi(argv[4]);
-        threshold = (argc == 6 || argc == 7) ? atof(argv[5]) : 10;             // Use command line value if provided
-        length_diff_cutoff = argc == 7 ? atof(argv[6]) : 0.35;  // Use command line value if provided
-        
+        threshold = (argc > 5) ? atof(argv[5]) : 10;             // Use command line value if provided
+        length_diff_cutoff = argc > 6 ? atof(argv[6]) : 0.35;                  // Use command line value if provided
+        if (argc > 7) {
+            if (argv[7][0] == 'c') background_correction = 1;
+            if (argv[7][0] == 's') background_correction = 2;
+        }
         print_only_localmax = 1;
         // Allocate 5D results array
-        results = allocate_5d_results(shortest_kmer, longest_kmer);
+        results = allocate_5d_results(shortest_kmer, longest_kmer, SHIFTED_GAP_POSITIONS);
         if (!results) {
             fprintf(stderr, "ERROR: Memory allocation failed for results array\n");
             return 1;
@@ -1762,6 +2577,7 @@ int main(int argc, char* argv[]) {
     //        base_kmer_length-1, base_kmer_length, base_kmer_length+1);
     
     GenerateMask ();
+    PWMConsumerArgs pwm_args;
     
     // Process each file
     for (int file_idx = 0; file_idx < NUM_FILES; file_idx++) {
@@ -1783,14 +2599,47 @@ int main(int argc, char* argv[]) {
         if (count_kmers == 1) pthread_create(&consumer_thread, NULL, consumer, &buffer);
         else {
             // Create and initialize the PWMConsumerArgs structure
-            PWMConsumerArgs pwm_args;
+            
             pwm_args.buffer = &buffer;
             pwm_args.signal_pwm = &qp;
             pwm_args.background_pwm = NULL;  // Or appropriate background PWM if you have one
             pwm_args.signal_output_pwm = &count_pwms[1];
             pwm_args.background_output_pwm = &count_pwms[0];
             pwm_args.cutoff = 0 - (double) multinomial - 0.0001;
-            
+
+            // Initialize arrays for file counts
+            pwm_args.num_files = 2;  // For background and signal
+            if (buffer.file_index == 0) {
+                pwm_args.total_reads = calloc(pwm_args.num_files, sizeof(_Atomic(size_t)));
+                pwm_args.matched_reads = calloc(pwm_args.num_files, sizeof(_Atomic(size_t)));
+                
+                // Initialize k-mer counting parameters
+                pwm_args.kmer_length = kmer_length;  // Use specified kmer length
+                pwm_args.signal_pwm->enrichment = cmd_lambda;    // Pass command-line lambda value
+                
+                // Calculate size needed for k-mer counts arrays (4^k possible k-mers)
+                size_t kmer_count_size = 1ULL << (2 * pwm_args.kmer_length); // 4^k
+                
+                // Allocate and zero-initialize k-mer count arrays for both files
+                pwm_args.kmer_counts = (uint64_t**)malloc(pwm_args.num_files * sizeof(uint64_t*));
+                if (!pwm_args.kmer_counts) {
+                    fprintf(stderr, "Failed to allocate memory for k-mer counting array pointers\n");
+                    return 1;
+                }
+                
+                for (int i = 0; i < pwm_args.num_files; i++) {
+                    pwm_args.kmer_counts[i] = (uint64_t*)calloc(kmer_count_size+1, sizeof(uint64_t));
+                    if (!pwm_args.kmer_counts[i]) {
+                        fprintf(stderr, "Failed to allocate memory for k-mer counting array %d\n", i);
+                        // Clean up previously allocated memory
+                        for (int j = 0; j < i; j++) {
+                            free(pwm_args.kmer_counts[j]);
+                        }
+                        free(pwm_args.kmer_counts);
+                        return 1;
+                    }
+                }
+            }
             pthread_create(&consumer_thread, NULL, PWM_generator_consumer, &pwm_args);
         }
 
@@ -1799,20 +2648,21 @@ int main(int argc, char* argv[]) {
 
         destroy_buffer(&buffer);
         free(buffer.bitstream);
+        free(buffer.temp_bitstream);
     }
     
     if (count_kmers == 1) {
-    int file = 0;
-    // PRINT KMERS
-    // for (int file = 0; file < NUM_FILES; file++) {
-    //    printf("\nFile %d results:\n", file);
-        printf("kmer\tgap position\tgap length\tbackground\tsignal\tLocalmax\n");
+        int file = 0;
+        // PRINT KMERS
+        // for (int file = 0; file < NUM_FILES; file++) {
+        //    printf("\nFile %d results:\n", file);
+        printf("kmer\tgap position\tgap length\tbackground\tsignal\tLocalmax\tshift_ratio\tIC\tavg_var\texp_var\n");
         
         // First print ungapped kmers above threshold for all lengths
         for (int klen = shortest_kmer; klen <= longest_kmer; klen++) {
             if (klen <= 0) continue;
             print_kmers_single_config(results, file, klen, shortest_kmer, longest_kmer,
-                                    0, 0, threshold, print_only_localmax, length_diff_cutoff);
+                                    0, 0, threshold, print_only_localmax, background_correction, length_diff_cutoff);
         }
         
         // Then print gapped local maxima
@@ -1825,14 +2675,14 @@ int main(int argc, char* argv[]) {
                 int gap_pos = klen/2;
                 for (int gap_len = 1; gap_len <= 10; gap_len++) {
                     print_kmers_single_config(results, file, klen, shortest_kmer, longest_kmer,
-                                            gap_pos, gap_len, threshold, print_only_localmax, length_diff_cutoff);
+                                            gap_pos, gap_len, threshold, print_only_localmax, background_correction, length_diff_cutoff);
                 }
             } else {
                 // Odd length: two center positions
                 for (int gap_pos = klen/2; gap_pos <= klen/2 + 1; gap_pos++) {
                     for (int gap_len = 1; gap_len <= 10; gap_len++) {
                         print_kmers_single_config(results, file, klen, shortest_kmer, longest_kmer,
-                                                gap_pos, gap_len, threshold, print_only_localmax, length_diff_cutoff);
+                                                gap_pos, gap_len, threshold, print_only_localmax, background_correction, length_diff_cutoff);
                     }
                 }
             }
@@ -1840,16 +2690,43 @@ int main(int argc, char* argv[]) {
     }
     else {
         int seed_length = strlen(seed);
-        printf("\nMotif from all matches to seed in signal file (no background correction)");
+        if (background_correction) {
+            printf("\nMotif from all matches to seed in signal file (background corrected using lambda=%.4f)",
+                  count_pwms[1].enrichment);
+        } else {
+            printf("\nMotif from all matches to seed in signal file (no background correction)");
+        }
+        //PrintMotif(&count_pwms[0], multinomial, seed_length);  // Print the background PWM
         PrintMotif(&count_pwms[1], multinomial, seed_length);  // Print the signal PWM
+        printf("\nMatch statistics:");
+        printf("\nBackground: %zu matched / %zu total (%.4f%%)",
+              pwm_args.matched_reads[0], pwm_args.total_reads[0],
+              100.0 * pwm_args.matched_reads[0] / pwm_args.total_reads[0]);
+        printf("\nSignal: %zu matched / %zu total (%.4f%%)\n",
+              pwm_args.matched_reads[1], pwm_args.total_reads[1],
+              100.0 * pwm_args.matched_reads[1] / pwm_args.total_reads[1]);
     }
     
     // Cleanup
-    if (count_kmers == 1) free_5d_results(results, shortest_kmer, longest_kmer);
+    if (count_kmers == 1) {
+        free_5d_results(results, shortest_kmer, longest_kmer);
+    } else {
+        // Free k-mer counting resources
+        if (pwm_args.kmer_counts) {
+            for (int i = 0; i < pwm_args.num_files; i++) {
+                if (pwm_args.kmer_counts[i]) {
+                    free(pwm_args.kmer_counts[i]);
+                }
+            }
+            free(pwm_args.kmer_counts);
+        }
+        free(pwm_args.total_reads);
+        free(pwm_args.matched_reads);
+    }
     
     clock_t end = clock();
     double cpu_time_used = ((double) (end - start)) / CLOCKS_PER_SEC;
-    printf("Total execution time: %.2f seconds\n", cpu_time_used);
+    printf("\nTotal execution time: %.2f seconds\n", cpu_time_used);
     
     return 0;
 }

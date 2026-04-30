@@ -420,8 +420,13 @@ short int Multinomial_add_to_pwm_from_bitstream(struct count_pwm *p, struct norm
             else
             {
                 // printf("\nAdding nucleotide %c to PWM position %i, shifted match %i", "ACGT"[nucleotide], pwm_position, shifted_match_position);
-                __atomic_add_fetch(&((*p).incidence[nucleotide][pwm_position]), 1, __ATOMIC_SEQ_CST);
-                //(*p).incidence[nucleotide][pwm_position]++;
+
+                #ifdef __clang__
+                __atomic_add_fetch(&((*p).incidence[nucleotide][pwm_position]), 1.0, __ATOMIC_SEQ_CST);
+                #else
+                (*p).incidence[nucleotide][pwm_position] += 1.0; // NOT SAFE FOR MULTITHREADING IF ADDED
+                #endif
+
                 pwm_position--;
             }
             }

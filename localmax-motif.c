@@ -77,7 +77,7 @@ typedef struct PWMConsumerArgs {
 struct match {short int *position; double *score;};
 short int match_init (struct match *i, short int width)
 {
-short int maximum_width = Nlength+10;
+short int maximum_width = MAX_SEQ_LEN*2+10;
 short int counter;
 (*i).position = malloc(sizeof(short int) * maximum_width + 5);
 (*i).score = malloc(sizeof(double) * maximum_width + 5);
